@@ -44,5 +44,14 @@ Python · pandas · scikit-learn · XGBoost · matplotlib
 ## Roadmap
 
 - [x] Phase 1 — EDA, cleaning, model training
-- [ ] Phase 2 — Web interface (Streamlit)
+- [x] Phase 2 — Web interface (Streamlit) — in progress
 - [ ] Phase 3 — Automated weekly data updates
+
+## Dev log
+
+| Date | Progress |
+|---|---|
+| Jun 25, 2026 | Dataset downloaded, EDA completed |
+| Jun 26, 2026 | Data cleaning, first Random Forest model (R² 0.41) |
+| Jun 27, 2026 | Added appearance stats, XGBoost — R² improved to 0.696 |
+| Jul 2, 2026 | Streamlit web app — player search with market value display |
