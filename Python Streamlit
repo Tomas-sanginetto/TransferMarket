@@ -1,0 +1,68 @@
+import streamlit as st # "st" es el alias de streamlit, pura comodidad
+import pandas as pd # "pd" es el alias de pandas
+import numpy as np # "np" es el alias de numpy
+import joblib # Para cargar el modelo guardado
+from datetime import datetime # Para calcular la fecha de hace 2 años dinamicamente
+
+# @st.cache_data hace que los datos se carguen UNA SOLA VEZ y se guarden en memoria
+# Sin esto, cada vez que el usuario escribe algo recarga todo desde cero (muy lento)
+@st.cache_data
+def cargar_datos():
+    df_players = pd.read_csv("players.csv")
+    df_apps = pd.read_csv("appearances.csv")
+    return df_players, df_apps
+
+modelo = joblib.load("modelo_transfermkt.pkl") # Carga el modelo XGBoost que entrenamos
+df_players, df_apps = cargar_datos() # Llama a la funcion — solo carga una vez
+
+# Preparamos las estadisticas de los ultimos 2 años (dinamico, siempre desde hoy)
+df_apps['date'] = pd.to_datetime(df_apps['date']) # Convertimos la fecha de texto a fecha real
+hace_2_anios = pd.Timestamp(datetime.now()) - pd.DateOffset(years=2) # Fecha de hace 2 años
+df_recent = df_apps[df_apps['date'] >= hace_2_anios] # Solo los partidos de los ultimos 2 años
+
+# Agrupamos por jugador y sumamos sus estadisticas recientes
+stats = df_recent.groupby('player_id').agg(
+    goals_2y=('goals', 'sum'),           # Total de goles en 2 años
+    assists_2y=('assists', 'sum'),        # Total de asistencias en 2 años
+    minutes_2y=('minutes_played', 'sum'), # Total de minutos jugados en 2 años
+    games_2y=('appearance_id', 'count')   # Total de partidos jugados en 2 años
+).reset_index()
+
+# Calculamos promedios por partido (mas util que los totales)
+stats['goals_per_game'] = stats['goals_2y'] / stats['games_2y']
+stats['assists_per_game'] = stats['assists_2y'] / stats['games_2y']
+stats['minutes_per_game'] = stats['minutes_2y'] / stats['games_2y']
+
+# Titulo y subtitulo de la web
+st.title("⚽ Football Value Intelligence")
+st.subheader("Detectá jugadores subvalorados y sobrevalorados")
+
+# Lista de nombres para el autocomplete (se genera una sola vez gracias al cache)
+nombres_disponibles = sorted(df_players['name'].dropna().unique().tolist())
+
+# Buscador con autocomplete
+# placeholder muestra texto de ejemplo cuando esta vacio
+# El usuario escribe y filtra la lista — el nombre escrito siempre se ve arriba
+nombre = st.selectbox(
+    "Buscá un jugador:",
+    options=[""] + nombres_disponibles,
+    placeholder="Escribí un nombre...",
+    index=0
+)
+
+if nombre: # Solo se ejecuta si el usuario selecciono algo
+    jugador = df_players[df_players['name'] == nombre].iloc[0]
+
+    # Mostramos la info basica del jugador
+    st.write(f"**{jugador['name']}** — {jugador['current_club_name']} — {jugador['position']}")
+
+    # Mostramos su valor en Transfermarkt (€ adelante, punto como separador de miles)
+    if pd.notna(jugador['market_value_in_eur']):
+        valor = int(jugador['market_value_in_eur'])
+        valor_formateado = "{:,}".format(valor).replace(",", ".")
+        st.write(f"Valor Transfermarkt: €{valor_formateado}")
+        # Formateamos el numero con puntos como separador de miles y el € adelante
+    else:
+        st.write("Sin valor registrado en Transfermarkt")
+
+# Para correr la app: streamlit run app.py en la terminal
