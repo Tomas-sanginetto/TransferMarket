@@ -55,3 +55,4 @@ Python · pandas · scikit-learn · XGBoost · matplotlib
 | Jun 26, 2026 | Data cleaning, first Random Forest model (R² 0.41) |
 | Jun 27, 2026 | Added appearance stats, XGBoost — R² improved to 0.696 |
 | Jul 2, 2026 | Streamlit web app — player search with market value display |
+| Jul 22, 2026 | Streamlit app now shows model prediction and under/overvalued verdict |
