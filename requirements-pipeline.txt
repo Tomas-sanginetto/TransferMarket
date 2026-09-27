@@ -1,0 +1,5 @@
+# Para correr preparar_datos.py (entrenamiento). La app solo usa requirements.txt
+pandas
+numpy
+scikit-learn
+xgboost

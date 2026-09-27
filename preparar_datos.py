@@ -2,124 +2,161 @@
 # ============================================================================
 # preparar_datos.py
 # ----------------------------------------------------------------------------
-# Este script se corre UNA sola vez (o cada vez que actualizamos los datos).
-# Hace todo el trabajo pesado: reconstruye los features, corre el modelo, y
-# guarda un unico archivo chico (app_data.csv) con todo lo que la app necesita.
-#
-# Asi la app deployada NO tiene que cargar appearances.csv (148 MB) ni el modelo.
-# Solo lee app_data.csv, que pesa pocos MB. Queda rapida y se puede subir a GitHub.
+# Pipeline completo. Se corre UNA vez (o cada vez que se actualizan los CSV):
+#   1. Construye los features con features.py
+#   2. Evalua el modelo con validacion cruzada (5 folds)
+#   3. Entrena el modelo final y lo guarda
+#   4. Genera app_data.csv y metricas.json para la app
 #
 # Correr con:  python preparar_datos.py
+# Requiere:    pip install -r requirements-pipeline.txt
 # ============================================================================
 
-import pandas as pd
+import json
+
 import numpy as np
-import joblib
-from datetime import datetime
+import pandas as pd
+from sklearn.metrics import mean_absolute_error, r2_score
+from sklearn.model_selection import KFold
+from xgboost import XGBRegressor
 
-print("Cargando datos...")
-df_players = pd.read_csv("players.csv")
-df_apps = pd.read_csv("appearances.csv")
-df_competitions = pd.read_csv("competitions.csv")
-modelo = joblib.load("modelo_transfermkt.pkl")
+import features as F
 
-print("Construyendo features (mismo pipeline que el notebook 02)...")
-df = df_players.copy()
+SEMILLA = 42
+N_FOLDS = 5
+PARAMS_XGB = dict(
+    n_estimators=600,
+    learning_rate=0.05,
+    max_depth=6,
+    min_child_weight=3,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    random_state=SEMILLA,
+    n_jobs=-1,
+)
 
-# Edad (igual que en el entrenamiento: 2024 como año de referencia)
-df['date_of_birth'] = pd.to_datetime(df['date_of_birth'])
-df['age'] = 2024 - df['date_of_birth'].dt.year
 
-# Estadisticas de TODA la carrera
-stats_carrera = df_apps.groupby('player_id').agg(
-    total_goals=('goals', 'sum'),
-    total_assists=('assists', 'sum'),
-    total_minutes=('minutes_played', 'sum'),
-    total_games=('appearance_id', 'count')
-).reset_index()
-df = df.merge(stats_carrera, on='player_id', how='left')
-cols_carrera = ['total_goals', 'total_assists', 'total_minutes', 'total_games']
-df[cols_carrera] = df[cols_carrera].fillna(0)
+def nuevo_modelo():
+    return XGBRegressor(**PARAMS_XGB)
 
-# Columnas utiles (mismo orden que en el notebook)
-columnas = [
-    'player_id', 'market_value_in_eur', 'age', 'position', 'sub_position',
-    'height_in_cm', 'foot', 'international_caps', 'international_goals',
-    'current_club_domestic_competition_id',
-    'total_goals', 'total_assists', 'total_minutes', 'total_games'
-]
-df = df[columnas]
 
-# Misma limpieza
-df = df.dropna(subset=['market_value_in_eur', 'age', 'sub_position',
-                       'current_club_domestic_competition_id'])
-df['height_in_cm'] = df['height_in_cm'].fillna(df['height_in_cm'].median())
-df['foot'] = df['foot'].fillna('right')
-df['international_caps'] = df['international_caps'].fillna(0)
-df['international_goals'] = df['international_goals'].fillna(0)
-df = df[(df['age'] >= 15) & (df['age'] <= 45)]
+def metricas(y_log, pred_log):
+    """R² y MAE en escala log, y error porcentual mediano en euros."""
+    real = np.expm1(y_log)
+    pred = np.expm1(pred_log)
+    return {
+        "n": int(len(y_log)),
+        "r2_log": round(float(r2_score(y_log, pred_log)), 4),
+        "mae_log": round(float(mean_absolute_error(y_log, pred_log)), 4),
+        "error_pct_mediano": round(float(np.median(np.abs(pred - real) / real) * 100), 1),
+    }
 
-# Guardamos los ids que sobrevivieron la limpieza (para juntar datos despues)
-ids_limpios = df['player_id'].copy()
 
-# One-Hot Encoding
-df_encoded = pd.get_dummies(df, columns=['position', 'sub_position', 'foot',
-                                         'current_club_domestic_competition_id'])
+def main():
+    print("1/4 Construyendo features...")
+    df, meta = F.construir_dataset(F.cargar_crudos())
+    X = F.armar_X(df)
 
-# Estadisticas de los ULTIMOS 2 AÑOS (dinamico desde hoy)
-df_apps['date'] = pd.to_datetime(df_apps['date'])
-hace_2_anios = pd.Timestamp(datetime.now()) - pd.DateOffset(years=2)
-df_recent = df_apps[df_apps['date'] >= hace_2_anios]
+    tiene_valor = df["market_value_in_eur"].notna().to_numpy()
+    y_log = np.log1p(df["market_value_in_eur"].to_numpy())
+    cubierto = df["liga_con_estadisticas"].to_numpy()
 
-stats_recent = df_recent.groupby('player_id').agg(
-    goals_2y=('goals', 'sum'),
-    assists_2y=('assists', 'sum'),
-    minutes_2y=('minutes_played', 'sum'),
-    games_2y=('appearance_id', 'count')
-).reset_index()
-stats_recent['goals_per_game'] = stats_recent['goals_2y'] / stats_recent['games_2y']
-stats_recent['assists_per_game'] = stats_recent['assists_2y'] / stats_recent['games_2y']
-stats_recent['minutes_per_game'] = stats_recent['minutes_2y'] / stats_recent['games_2y']
+    X_tr, y_tr = X[tiene_valor], y_log[tiene_valor]
+    grupo_tr = (df.loc[tiene_valor, "liga_id"] + "|" + df.loc[tiene_valor, "position"]).to_numpy()
 
-df_encoded = df_encoded.merge(stats_recent, on='player_id', how='left')
-cols_recientes = ['goals_2y', 'assists_2y', 'minutes_2y', 'games_2y',
-                  'goals_per_game', 'assists_per_game', 'minutes_per_game']
-df_encoded[cols_recientes] = df_encoded[cols_recientes].fillna(0)
+    print(f"   Jugadores activos: {len(df)} | con valor de mercado: {int(tiene_valor.sum())}")
 
-print("Prediciendo con el modelo...")
-X = df_encoded.drop(columns=['market_value_in_eur', 'player_id'])
+    # ------------------------------------------------------------------------
+    # 2. Validacion cruzada: cada jugador recibe una prediccion hecha por un
+    #    modelo que NUNCA lo vio (out-of-fold). Antes prediciamos sobre los
+    #    mismos datos de entrenamiento, y eso achica las diferencias reales.
+    # ------------------------------------------------------------------------
+    print(f"2/4 Validacion cruzada ({N_FOLDS} folds)...")
+    oof = np.zeros(len(y_tr))
+    oof_base = np.zeros(len(y_tr))
+    kf = KFold(n_splits=N_FOLDS, shuffle=True, random_state=SEMILLA)
 
-# Alineamos columnas con lo que el modelo espera
-if hasattr(modelo, 'feature_names_in_'):
-    X = X.reindex(columns=modelo.feature_names_in_, fill_value=0)
+    for i, (a, b) in enumerate(kf.split(X_tr), start=1):
+        m = nuevo_modelo()
+        m.fit(X_tr.iloc[a], y_tr[a])
+        oof[b] = m.predict(X_tr.iloc[b])
 
-# expm1 deshace el log1p → euros reales
-predicciones = np.expm1(modelo.predict(X))
+        # Linea de base simple: mediana del valor por liga + posicion.
+        # Sirve para demostrar cuanto aporta el modelo por encima de algo trivial.
+        med = pd.Series(y_tr[a]).groupby(grupo_tr[a]).median()
+        oof_base[b] = pd.Series(grupo_tr[b]).map(med).fillna(np.median(y_tr[a])).to_numpy()
+        print(f"   fold {i}/{N_FOLDS} listo")
 
-print("Armando el archivo final...")
-# Diccionario codigo_liga -> nombre_liga
-mapa_ligas = dict(zip(df_competitions['competition_id'], df_competitions['name']))
+    cub_tr = cubierto[tiene_valor]
+    reporte = {
+        "modelo_total": metricas(y_tr, oof),
+        "modelo_ligas_con_estadisticas": metricas(y_tr[cub_tr], oof[cub_tr]),
+        "modelo_ligas_sin_estadisticas": metricas(y_tr[~cub_tr], oof[~cub_tr]),
+        "base_mediana_liga_posicion": metricas(y_tr, oof_base),
+    }
 
-# Traemos los datos "lindos" (nombre, club) desde players.csv original
-info = df_players.set_index('player_id')
+    # Umbral de "diferencia significativa" = error tipico del modelo en ese grupo
+    # (mediana del error absoluto en log). Si la diferencia es menor, es ruido.
+    err = np.abs(oof - y_tr)
+    umbral_cub = float(np.median(err[cub_tr]))
+    umbral_nocub = float(np.median(err[~cub_tr]))
 
-app_data = pd.DataFrame({
-    'player_id': df_encoded['player_id'].values,
-    'valor_predicho': predicciones,
-})
-app_data['name'] = app_data['player_id'].map(info['name'])
-app_data['current_club_name'] = app_data['player_id'].map(info['current_club_name'])
-app_data['position'] = app_data['player_id'].map(info['position'])
-app_data['market_value_in_eur'] = app_data['player_id'].map(info['market_value_in_eur'])
-app_data['competition_id'] = app_data['player_id'].map(info['current_club_domestic_competition_id'])
-app_data['liga'] = app_data['competition_id'].map(mapa_ligas)
+    # ------------------------------------------------------------------------
+    # 3. Modelo final con todos los datos (para jugadores sin valor de mercado)
+    # ------------------------------------------------------------------------
+    print("3/4 Entrenando modelo final...")
+    modelo = nuevo_modelo()
+    modelo.fit(X_tr, y_tr)
+    modelo.save_model(str(F.DATA_DIR / "modelo_transfermkt.json"))  # formato portable entre versiones
 
-# Estadisticas de 2 años para mostrar en la ficha del jugador
-stats_idx = stats_recent.set_index('player_id')
-for c in ['games_2y', 'goals_2y', 'assists_2y', 'minutes_per_game']:
-    app_data[c] = app_data['player_id'].map(stats_idx[c]).fillna(0)
+    pred_log = modelo.predict(X)                  # para quienes NO tienen valor
+    pred_log[tiene_valor] = oof                   # para quienes SI: out-of-fold
 
-# Guardamos. Formato parquet: mas chico y rapido que csv (requiere pyarrow)
-app_data.to_csv("app_data.csv", index=False)
-print(f"Listo. app_data.csv guardado con {len(app_data)} jugadores.")
-print(f"Tamaño aproximado en memoria: {app_data.memory_usage(deep=True).sum() / 1e6:.1f} MB")
+    importancias = (
+        pd.Series(modelo.feature_importances_, index=X.columns)
+        .sort_values(ascending=False).head(15).round(4).to_dict()
+    )
+
+    # ------------------------------------------------------------------------
+    # 4. Archivos para la app
+    # ------------------------------------------------------------------------
+    print("4/4 Guardando app_data.csv y metricas.json...")
+    salida = df[[
+        "player_id", "name", "club_nombre", "liga", "liga_id", "liga_con_estadisticas",
+        "position", "sub_position", "foot", "height_in_cm", "age",
+        "contract_expiration_date", "international_caps", "international_goals",
+        "market_value_in_eur",
+        "games_2y", "minutes_2y", "goals_2y", "assists_2y", "euro_games_2y",
+        "minutes_per_game_2y",
+        "career_games", "career_goals", "career_assists",
+        "club_position", "club_win_rate", "club_ppg",
+    ]].copy()
+    salida["valor_predicho"] = np.expm1(pred_log).round(0)
+    salida["umbral_log"] = np.where(cubierto, umbral_cub, umbral_nocub)
+    salida["contract_expiration_date"] = salida["contract_expiration_date"].dt.strftime("%Y-%m-%d")
+    salida["age"] = salida["age"].round(1)
+    salida.to_csv(F.DATA_DIR / "app_data.csv", index=False)
+
+    meta.update({
+        "metricas": reporte,
+        "umbral_log_con_estadisticas": round(umbral_cub, 4),
+        "umbral_log_sin_estadisticas": round(umbral_nocub, 4),
+        "importancias_top15": importancias,
+        "features": list(X.columns),
+        "params_xgb": PARAMS_XGB,
+    })
+    with open(F.DATA_DIR / "metricas.json", "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+    print()
+    print(f"Fecha de corte de los datos: {meta['fecha_ref']}")
+    for k, v in reporte.items():
+        print(f"  {k:32s} R²={v['r2_log']:.3f}  MAE={v['mae_log']:.3f}  "
+              f"error mediano={v['error_pct_mediano']}%  (n={v['n']})")
+    print(f"  Umbral significativo: con estadisticas ±{(np.exp(umbral_cub)-1)*100:.0f}% "
+          f"| sin estadisticas ±{(np.exp(umbral_nocub)-1)*100:.0f}%")
+    print(f"Listo. app_data.csv con {len(salida)} jugadores.")
+
+
+if __name__ == "__main__":
+    main()
